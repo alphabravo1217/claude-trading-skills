@@ -196,6 +196,21 @@ English README is available at [`README.md`](README.md).
   - ライフサイクル管理（IDEA → ENTRY_READY → ACTIVE → CLOSED）、ポジション付与、レビュースケジュール、MAE/MFE分析をサポート。
   - kanchi-dividend-sop、earnings-trade-analyzer、vcp-screener、pead-screener、canslim-screener、edge-candidate-agent と統合。
 
+- **エクスポージャーコーチ** (`exposure-coach`)
+  - market-breadth-analyzer、uptrend-analyzer、macro-regime-detector、market-top-detector、ftd-detector、theme-detector、sector-analyst、institutional-flow-tracker の出力を統合し、エクスポージャー決定を一元化。
+  - 「今、株式にどれだけ資本を投入すべきか？」という核心的な問いに回答。
+  - エクスポージャー上限（0-100%）、グロース/バリュー傾斜、参加幅評価、行動推奨（NEW_ENTRY_ALLOWED / REDUCE_ONLY / CASH_PRIORITY）を含む1ページのマーケットポスチャーサマリーを生成。
+  - 部分的な入力にも対応 — upstreamファイルが欠落してもconfidenceレベルが低下するだけで実行はブロックされない。
+  - FMP APIキーは任意（institutional-flow-trackerデータ利用時のみ必要）。
+
+- **シグナルポストモーテム** (`signal-postmortem`)
+  - エッジパイプライン、スクリーナー、他スキルが生成したシグナルの結果を記録・分析。
+  - TRUE_POSITIVE、FALSE_POSITIVE、MISSED_OPPORTUNITY、REGIME_MISMATCHの4カテゴリに分類。
+  - edge-signal-aggregator向けウェイト調整フィードバックとスキル改善バックログエントリを生成。
+  - 成熟シグナルのバッチ処理（5日/20日保有期間）と手動結果記録をサポート。
+  - スキル別・銘柄別・期間別の集計統計で定期的なシグナル品質監査に対応。
+  - FMP APIキーは任意（実現リターン取得用。手動価格入力にも対応）。
+
 ### マーケットタイミング・底打ち検出
 
 - **マーケットトップ検出器** (`market-top-detector`)
@@ -491,6 +506,8 @@ launchctl start com.trade-analysis.skill-generation-daily
 - **エッジパイプラインオーケストレータ** (`edge-pipeline-orchestrator`): APIキー不要（ローカルエッジスキルをsubprocess経由でオーケストレーション）
 - **エッジシグナルアグリゲータ** (`edge-signal-aggregator`): APIキー不要（ローカルJSON/YAML出力を統合し重み付けランキングを生成）
 - **Trader Memory Core** (`trader-memory-core`): 🟡 オプション — FMPはポストモーテムのMAE/MFEのみ使用。コア機能はオフラインで動作
+- **エクスポージャーコーチ** (`exposure-coach`): 🟡 オプション — FMPはinstitutional-flow-trackerデータ利用時のみ必要
+- **シグナルポストモーテム** (`signal-postmortem`): 🟡 オプション — FMPは実現リターン取得用。手動価格入力にも対応
 
 ## 参考リンク
 - Claude Skillsローンチ概要: https://www.anthropic.com/news/skills
