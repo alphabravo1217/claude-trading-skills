@@ -1049,6 +1049,65 @@ def test_check_unexpected_changes_detects_outside(pipeline_module, tmp_path: Pat
     assert result is False
 
 
+def test_check_unexpected_changes_allows_pyproject_and_docs(pipeline_module, tmp_path: Path):
+    """pyproject.toml and docs/ changes are allowed."""
+
+    def fake_run(cmd, **kwargs):
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "diff" in cmd_str and "--name-only" in cmd_str and "HEAD" in cmd_str:
+            return CompletedProcess(
+                cmd,
+                0,
+                "skills/my-skill/SKILL.md\npyproject.toml\n"
+                "docs/en/skills/my-skill.md\ndocs/ja/skills/my-skill.md\n",
+                "",
+            )
+        if "ls-files" in cmd_str:
+            return CompletedProcess(cmd, 0, "", "")
+        return CompletedProcess(cmd, 0, "", "")
+
+    with patch.object(pipeline_module.subprocess, "run", fake_run):
+        result = pipeline_module._check_unexpected_changes(tmp_path, "my-skill")
+
+    assert result is True
+
+
+def test_check_unexpected_changes_blocks_other_skill_docs(pipeline_module, tmp_path: Path):
+    """Doc changes for a DIFFERENT skill are blocked."""
+
+    def fake_run(cmd, **kwargs):
+        cmd_str = " ".join(str(c) for c in cmd)
+        if "diff" in cmd_str and "--name-only" in cmd_str and "HEAD" in cmd_str:
+            return CompletedProcess(
+                cmd,
+                0,
+                "skills/my-skill/SKILL.md\ndocs/en/skills/other-skill.md\n",
+                "",
+            )
+        if "ls-files" in cmd_str:
+            return CompletedProcess(cmd, 0, "", "")
+        return CompletedProcess(cmd, 0, "", "")
+
+    with patch.object(pipeline_module.subprocess, "run", fake_run):
+        result = pipeline_module._check_unexpected_changes(tmp_path, "my-skill")
+
+    assert result is False
+
+
+def test_extract_failed_hooks(pipeline_module):
+    """_extract_failed_hooks parses pre-commit output correctly."""
+    output = (
+        "trailing-whitespace..................................................Passed\n"
+        "ruff.................................................................Failed\n"
+        "docs-completeness...................................................Failed\n"
+        "codespell............................................................Passed\n"
+    )
+    result = pipeline_module._extract_failed_hooks(output)
+    assert "ruff" in result
+    assert "docs-completeness" in result
+    assert "codespell" not in result
+
+
 # -- Daily flow: existing PR sets pr_open --
 
 

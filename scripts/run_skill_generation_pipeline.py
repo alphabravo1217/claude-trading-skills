@@ -304,6 +304,49 @@ def rotate_logs(project_root: Path) -> None:
 
 _SAFE_DIRTY_PREFIXES = ("reports/", "logs/", "state/")
 
+_GIT_NETWORK_RETRY_WAIT = 30
+_GIT_NETWORK_MAX_RETRIES = 1
+
+
+def _git_network_cmd_with_retry(
+    cmd: list[str],
+    cwd: Path,
+    label: str,
+) -> subprocess.CompletedProcess | None:
+    """Run a git network command with retry on transient SSH/network errors.
+
+    Returns the CompletedProcess on success, or None on final failure.
+    """
+    import time
+
+    transient_patterns = [
+        "ssh: connect to host",
+        "Could not read from remote repository",
+        "Connection refused",
+        "Connection reset by peer",
+        "Connection timed out",
+    ]
+    for attempt in range(_GIT_NETWORK_MAX_RETRIES + 1):
+        result = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            return result
+        stderr = result.stderr.strip()
+        is_transient = any(p in stderr for p in transient_patterns)
+        if is_transient and attempt < _GIT_NETWORK_MAX_RETRIES:
+            logger.warning(
+                "%s failed (transient, attempt %d/%d): %s. Retrying in %ds.",
+                label,
+                attempt + 1,
+                _GIT_NETWORK_MAX_RETRIES + 1,
+                stderr[:200],
+                _GIT_NETWORK_RETRY_WAIT,
+            )
+            time.sleep(_GIT_NETWORK_RETRY_WAIT)
+            continue
+        logger.error("%s failed: %s", label, stderr[:300])
+        return None
+    return None
+
 
 def _is_safe_dirty_tree(porcelain_output: str) -> bool:
     """Return True when all dirty files are in safe (non-source) directories.
@@ -361,18 +404,10 @@ def git_safe_check(project_root: Path) -> bool:
             logger.error("Not on main branch (on '%s'). Aborting.", branch.stdout.strip())
             return False
 
-        pull = subprocess.run(
-            ["git", "pull", "--ff-only"],
-            cwd=project_root,
-            capture_output=True,
-            text=True,
-            check=False,
+        pull = _git_network_cmd_with_retry(
+            ["git", "pull", "--ff-only"], cwd=project_root, label="git pull"
         )
-        if pull.returncode != 0:
-            logger.warning(
-                "git pull --ff-only failed; will retry next run. stderr: %s",
-                pull.stderr.strip(),
-            )
+        if pull is None:
             return False
 
     except FileNotFoundError:
@@ -587,9 +622,21 @@ def register_testpaths(project_root: Path, skill_name: str) -> bool:
 
 
 def _get_staged_files(project_root: Path, skill_name: str) -> list[str]:
-    """Return list of staged files under the skill directory and pyproject.toml."""
+    """Return list of staged files under the skill directory, docs, and pyproject.toml."""
     result = subprocess.run(
-        ["git", "diff", "--cached", "--name-only", "--", f"skills/{skill_name}/", "pyproject.toml"],
+        [
+            "git",
+            "diff",
+            "--cached",
+            "--name-only",
+            "--",
+            f"skills/{skill_name}/",
+            "pyproject.toml",
+            f"docs/en/skills/{skill_name}.md",
+            f"docs/ja/skills/{skill_name}.md",
+            "docs/en/skills/index.md",
+            "docs/ja/skills/index.md",
+        ],
         cwd=project_root,
         capture_output=True,
         text=True,
@@ -598,6 +645,18 @@ def _get_staged_files(project_root: Path, skill_name: str) -> list[str]:
     if result.returncode != 0 or not result.stdout.strip():
         return []
     return [f.strip() for f in result.stdout.strip().splitlines() if f.strip()]
+
+
+def _extract_failed_hooks(output: str) -> str:
+    """Extract hook names that show 'Failed' from pre-commit output."""
+    failed = []
+    for line in output.splitlines():
+        # pre-commit output format: "hook-name...Failed" or "hook-name...Passed"
+        if "Failed" in line:
+            hook_name = line.split("...")[0].strip().split()[-1] if "..." in line else ""
+            if hook_name:
+                failed.append(hook_name)
+    return ", ".join(failed) if failed else ""
 
 
 # -- Daily flow: idea selection --
@@ -735,10 +794,19 @@ def _check_unexpected_changes(project_root: Path, skill_name: str) -> bool:
         f"skills/{skill_name}/",
         "reports/",
     ]
+    allowed_exact = [
+        "pyproject.toml",
+        f"docs/en/skills/{skill_name}.md",
+        f"docs/ja/skills/{skill_name}.md",
+        "docs/en/skills/index.md",
+        "docs/ja/skills/index.md",
+    ]
     unexpected = [
         f.strip()
         for f in all_changes
-        if f.strip() and not any(f.strip().startswith(p) for p in allowed_prefixes)
+        if f.strip()
+        and not any(f.strip().startswith(p) for p in allowed_prefixes)
+        and f.strip() not in allowed_exact
     ]
 
     if unexpected:
@@ -969,27 +1037,66 @@ def review_and_improve(
 
 def _rollback_skill(project_root: Path, skill_name: str, branch_name: str) -> None:
     """Roll back ALL changes and return to main."""
+    rollback_paths = [
+        f"skills/{skill_name}/",
+        "pyproject.toml",
+        f"docs/en/skills/{skill_name}.md",
+        f"docs/ja/skills/{skill_name}.md",
+        "docs/en/skills/index.md",
+        "docs/ja/skills/index.md",
+    ]
     # Unstage any staged changes
     subprocess.run(
-        ["git", "reset", "HEAD", "--", f"skills/{skill_name}/", "pyproject.toml"],
+        ["git", "reset", "HEAD", "--"] + rollback_paths,
         cwd=project_root,
         capture_output=True,
         check=False,
     )
     # Restore modified tracked files
-    subprocess.run(
-        ["git", "checkout", "--", f"skills/{skill_name}/", "pyproject.toml"],
+    restore = subprocess.run(
+        ["git", "checkout", "--"] + rollback_paths,
         cwd=project_root,
         capture_output=True,
+        text=True,
         check=False,
     )
-    # Remove untracked files/dirs under the skill (pyproject.toml is tracked, no clean needed)
-    subprocess.run(
-        ["git", "clean", "-fd", f"skills/{skill_name}/"],
+    # Fallback: git restore for files that git checkout missed
+    if restore.returncode != 0:
+        logger.info("git checkout restore failed; trying git restore fallback.")
+        subprocess.run(
+            ["git", "restore", "--"] + rollback_paths,
+            cwd=project_root,
+            capture_output=True,
+            check=False,
+        )
+    # Remove untracked files/dirs under the skill and generated docs
+    for clean_path in [
+        f"skills/{skill_name}/",
+        f"docs/en/skills/{skill_name}.md",
+        f"docs/ja/skills/{skill_name}.md",
+    ]:
+        subprocess.run(
+            ["git", "clean", "-fd", clean_path],
+            cwd=project_root,
+            capture_output=True,
+            check=False,
+        )
+    # Verify pyproject.toml is clean
+    verify = subprocess.run(
+        ["git", "diff", "--name-only", "--", "pyproject.toml"],
         cwd=project_root,
         capture_output=True,
+        text=True,
         check=False,
     )
+    if verify.stdout.strip():
+        logger.warning("pyproject.toml still dirty after rollback; forcing restore.")
+        subprocess.run(
+            ["git", "restore", "pyproject.toml"],
+            cwd=project_root,
+            capture_output=True,
+            check=False,
+        )
     # Return to main
     subprocess.run(
         ["git", "checkout", "main"],
@@ -1055,10 +1162,47 @@ def create_skill_pr(
         logger.error("git add failed: %s", result.stderr.strip()[:300])
         return None
 
-    # Run pre-commit hooks
+    # Generate doc pages (satisfies docs-completeness hook)
+    doc_gen_script = project_root / "scripts" / "generate_skill_docs.py"
+    if doc_gen_script.exists():
+        doc_result = subprocess.run(
+            [sys.executable, str(doc_gen_script), "--skill", skill_name],
+            cwd=project_root,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=60,
+        )
+        if doc_result.returncode == 0:
+            # Stage generated doc files
+            doc_paths = [f"docs/en/skills/{skill_name}.md", f"docs/ja/skills/{skill_name}.md"]
+            for dp in doc_paths:
+                if (project_root / dp).exists():
+                    stage_paths.append(dp)
+            # Also stage updated index files
+            for idx in ["docs/en/skills/index.md", "docs/ja/skills/index.md"]:
+                if (project_root / idx).exists():
+                    stage_paths.append(idx)
+            subprocess.run(
+                ["git", "add"] + stage_paths,
+                cwd=project_root,
+                capture_output=True,
+                check=False,
+            )
+            logger.info("Generated and staged doc pages for %s.", skill_name)
+        else:
+            logger.warning(
+                "generate_skill_docs.py failed (non-fatal): %s",
+                doc_result.stderr.strip()[:200],
+            )
+
+    # Run pre-commit hooks (up to 3 fix-and-restage cycles)
+    max_precommit_attempts = 3
     if shutil.which("pre-commit"):
-        staged = _get_staged_files(project_root, skill_name)
-        if staged:
+        for attempt in range(1, max_precommit_attempts + 1):
+            staged = _get_staged_files(project_root, skill_name)
+            if not staged:
+                break
             pc_result = subprocess.run(
                 ["pre-commit", "run", "--files"] + staged,
                 cwd=project_root,
@@ -1066,31 +1210,35 @@ def create_skill_pr(
                 text=True,
                 check=False,
             )
-            if pc_result.returncode != 0:
-                logger.info("pre-commit auto-fixed files; re-staging.")
-                restage = subprocess.run(
-                    ["git", "add"] + stage_paths,
-                    cwd=project_root,
-                    check=False,
-                    capture_output=True,
-                    text=True,
+            if pc_result.returncode == 0:
+                break
+            # Log which hooks failed for debugging
+            pc_output = (pc_result.stdout or "") + "\n" + (pc_result.stderr or "")
+            failed_hooks = _extract_failed_hooks(pc_output)
+            logger.info(
+                "pre-commit attempt %d/%d failed (hooks: %s); re-staging.",
+                attempt,
+                max_precommit_attempts,
+                failed_hooks or "unknown",
+            )
+            if attempt == max_precommit_attempts:
+                logger.error(
+                    "pre-commit still failing after %d attempts. Failed hooks: %s. Output: %s",
+                    max_precommit_attempts,
+                    failed_hooks,
+                    pc_output.strip()[:500],
                 )
-                if restage.returncode != 0:
-                    logger.error("git re-add failed: %s", restage.stderr.strip()[:300])
-                    return None
-                # 2nd pass
-                staged2 = _get_staged_files(project_root, skill_name)
-                if staged2:
-                    pc2 = subprocess.run(
-                        ["pre-commit", "run", "--files"] + staged2,
-                        cwd=project_root,
-                        capture_output=True,
-                        text=True,
-                        check=False,
-                    )
-                    if pc2.returncode != 0:
-                        logger.error("pre-commit still failing after auto-fix.")
-                        return None
+                return None
+            restage = subprocess.run(
+                ["git", "add"] + stage_paths,
+                cwd=project_root,
+                check=False,
+                capture_output=True,
+                text=True,
+            )
+            if restage.returncode != 0:
+                logger.error("git re-add failed: %s", restage.stderr.strip()[:300])
+                return None
 
     score = 0
     if report:
@@ -1112,15 +1260,12 @@ def create_skill_pr(
         logger.error("git commit failed: %s", commit_output[:500])
         return None
 
-    push = subprocess.run(
+    push = _git_network_cmd_with_retry(
         ["git", "push", "-u", "origin", branch_name],
         cwd=project_root,
-        capture_output=True,
-        text=True,
-        check=False,
+        label="git push",
     )
-    if push.returncode != 0:
-        logger.error("git push failed: %s", push.stderr.strip()[:300])
+    if push is None:
         return None
 
     title_text = idea.get("title", skill_name)
@@ -1413,17 +1558,25 @@ def run_daily(project_root: Path, dry_run: bool = False) -> int:
             _record_daily_state(project_root, idea, skill_name, idea_id, 0, None, "pr_failed")
             return 1
 
-        # Step 15: Mark as completed
-        update_backlog_status(project_root, idea_id, "completed", pr_url=pr_url)
-
-        # Step 16: Return to main
-        subprocess.run(
+        # Step 15: Return to main (before marking completed)
+        checkout_main = subprocess.run(
             ["git", "checkout", "main"],
             cwd=project_root,
             capture_output=True,
+            text=True,
             check=False,
         )
-        created_branch = False
+        if checkout_main.returncode != 0:
+            logger.warning(
+                "git checkout main failed after PR creation (PR %s still valid): %s",
+                pr_url,
+                checkout_main.stderr.strip()[:200],
+            )
+        else:
+            created_branch = False
+
+        # Step 16: Mark as completed (after successful return to main)
+        update_backlog_status(project_root, idea_id, "completed", pr_url=pr_url)
 
         # Step 17: Summary and state
         score = 0
